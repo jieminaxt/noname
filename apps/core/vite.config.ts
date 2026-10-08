@@ -18,7 +18,8 @@ export default defineConfig({
 	},
 	plugins: [vue()],
 	server: {
-		host: "127.0.0.1",
+		host: true,
+		allowedHosts: [".monkeycode-ai.online"],
 		port: port.client,
 		fs: {
 			allow: ["../.."],
