@@ -10,6 +10,8 @@ extension/**
 !extension/欢乐卡牌/**
 !extension/玩点论杀/**
 !extension/英雄杀/**
+!extension/自用ai/
+!extension/自用ai/**
 
 dist
 dist-types
