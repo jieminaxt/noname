@@ -97,6 +97,7 @@ const esbuildMain = resolveEsbuild();
 const { build: esbuildBuild } = await import(esbuildMain);
 
 const entrySrc = `export { lib, game, ui, get, ai, _status } from "${join(CORE_DIR, "noname.js")}";
+export { CacheContext } from "${join(CORE_DIR, "noname/library/cache/cacheContext.js")}";
 export { loadCard } from "${join(CORE_DIR, "noname/init/loading.ts")}";
 export { default as standard } from "${join(CORE_DIR, "card/standard.js")}";
 export { install as installCheckopt } from "${join(CORE_DIR, "extension/自用ai/js/checkopt.js")}";
@@ -109,7 +110,7 @@ await esbuildBuild({
 });
 
 const mod = await import(outfile);
-const { lib, game, ui, get, _status, loadCard, standard, installCheckopt } = mod;
+const { lib, game, ui, get, _status, loadCard, standard, installCheckopt, CacheContext } = mod;
 
 // 后台异步异常（MutationObserver 等 UI 副作用）打印但不退出进程
 process.on("uncaughtException", (e) => {
@@ -177,6 +178,10 @@ function makeGame(seed) {
 	}
 	game.dead = [];
 	const p0 = players[0];
+	// 座位环链（get.distance 依赖 nextSeat 遍历计算距离）
+	for (let i = 0; i < players.length; i++) {
+		players[i].nextSeat = players[(i + 1) % players.length];
+	}
 	// p0 的候选手牌：12 张装备 + 28 张杂牌
 	const hand = [];
 	for (let i = 0; i < 12; i++) {
@@ -244,11 +249,15 @@ const ownerOrig = get.owner;
 const filterCardOrig = lib.filter.filterCard;
 const autoViewAsOrig = get.autoViewAs;
 const getModableSkillsOrig = lib.element.Player.prototype.getModableSkills;
+const mhsOrig = lib.element.Player.prototype.mayHaveShan;
+const mssOrig = lib.element.Player.prototype.mayHaveSha;
 let COUNT_CAN_EQUIP = 0;
 let COUNT_OWNER = 0;
 let COUNT_FILTERCARD = 0;
 let COUNT_AUTOVIEW = 0;
 let COUNT_MODABLE = 0;
+let COUNT_MHS = 0;
+let COUNT_MSS = 0;
 lib.element.Player.prototype.canEquip = function (...a) { COUNT_CAN_EQUIP++; return canEquipOrig.apply(this, a); };
 get.owner = function (...a) { COUNT_OWNER++; return ownerOrig.apply(this, a); };
 lib.filter.filterCard = function (...a) {
@@ -260,6 +269,20 @@ lib.filter.filterCard = function (...a) {
 // modable 技能列表的真实重算次数。
 get.autoViewAs = function (...a) { COUNT_AUTOVIEW++; return autoViewAsOrig.apply(this, a); };
 lib.element.Player.prototype.getModableSkills = function (...a) { COUNT_MODABLE++; return getModableSkillsOrig.apply(this, a); };
+// 8.7 响应估值计数器：只在真正执行原函数（缓存未命中）时才累计
+lib.element.Player.prototype.mayHaveShan = function (...a) { COUNT_MHS++; return mhsOrig.apply(this, a); };
+lib.element.Player.prototype.mayHaveSha = function (...a) { COUNT_MSS++; return mssOrig.apply(this, a); };
+// 8.8 已知手牌计数器：只在真正执行原 getKnownCards（缓存未命中）时累计
+const gkcOrig = lib.element.Player.prototype.getKnownCards;
+let COUNT_GKC = 0;
+lib.element.Player.prototype.getKnownCards = function (...a) { COUNT_GKC++; return gkcOrig.apply(this, a); };
+// 8.9 顺手/过河 result.target 计数器：只在真正执行原判定（缓存未命中）时累计
+const ssRTOrig = lib.card.shunshou.ai.result.target;
+const ghRTOrig = lib.card.guohe.ai.result.target;
+let COUNT_SS_RT = 0;
+let COUNT_GH_RT = 0;
+lib.card.shunshou.ai.result.target = function (...a) { COUNT_SS_RT++; return ssRTOrig.apply(this, a); };
+lib.card.guohe.ai.result.target = function (...a) { COUNT_GH_RT++; return ghRTOrig.apply(this, a); };
 installCheckopt();
 const patchedCanEquip = lib.element.Player.prototype.canEquip;
 
@@ -437,6 +460,241 @@ for (let g = 0; g < GAMES; g++) {
 		const onMods = g.players.map(p => p.getModableSkills().join(","));
 		assert(offMods.join("|") === onMods.join("|"), "场景5 全部玩家 getModableSkills 开/关 一致");
 	}
+
+	// 场景 6：8.7 响应估值缓存 mayHaveShan / mayHaveSha
+	//   - 开/关 在 (type × ignore × rvt) 各参数组合下结果一致
+	//   - 同事件内重复调用命中缓存（原函数不重算，COUNT 不涨）
+	//   - 手牌结构 / 体力变化 ⇒ 指纹失效 ⇒ 原函数重算，结果仍与 OFF 一致
+	{
+		const tgt = g.players[1];
+		tgt.node.handcards1.childNodes.forEach(n => n.remove());
+		for (let i = 0; i < 40; i++) {
+			tgt.node.handcards1.appendChild(game.createCard(fillerNames[i % fillerNames.length], suits[i % 4], ((i * 5) % 13) + 1));
+		}
+		tgt.hp = 3; tgt.maxHp = 5; tgt.hujia = 0; tgt.isZhu = false;
+		const combos = [
+			["use", true, "count"],
+			["use", true, "odds"],
+			["use", null, "count"],
+			["respond", null, "count"],
+			["use", false, "count"],
+		];
+		const evalShan = (target, viewer, comb) => comb.map(([type, ignore, rvt]) => target.mayHaveShan(viewer, type, ignore, rvt));
+		const evalSha = (target, viewer, comb) => comb.map(([type, ignore, rvt]) => target.mayHaveSha(viewer, type, ignore, rvt));
+		const snap = (a) => JSON.stringify(a);
+
+		lib.config.extension_自用ai_checkopt = false;
+		makeEvent(p0);
+		const offShan = evalShan(tgt, p0, combos);
+		const offSha = evalSha(tgt, p0, combos);
+
+		lib.config.extension_自用ai_checkopt = undefined;
+		makeEvent(p0);
+		const c0Mhs = COUNT_MHS, c0Mss = COUNT_MSS;
+		const onShan = evalShan(tgt, p0, combos);
+		const onSha = evalSha(tgt, p0, combos);
+		const firstMhs = COUNT_MHS - c0Mhs;
+		const firstMss = COUNT_MSS - c0Mss;
+		assert(snap(onShan) === snap(offShan), "场景6 ON/OFF mayHaveShan 各参数组合一致");
+		assert(snap(onSha) === snap(offSha), "场景6 ON/OFF mayHaveSha 各参数组合一致");
+		assert(firstMhs === combos.length, `场景6 首次各参数各原算一次(${firstMhs}/${combos.length})`);
+		assert(firstMss === combos.length, `场景6 mayHaveSha 首次各参数各原算一次(${firstMss}/${combos.length})`);
+
+		const repeatShan = evalShan(tgt, p0, combos);
+		const repeatSha = evalSha(tgt, p0, combos);
+		const d2Mhs = COUNT_MHS - c0Mhs, d2Mss = COUNT_MSS - c0Mss;
+		assert(snap(repeatShan) === snap(onShan) && snap(repeatSha) === snap(onSha), "场景6 同事件重复调用结果稳定");
+		assert(d2Mhs === firstMhs, `场景6 同事件重复调用 mayHaveShan 不重算(${d2Mhs}==${firstMhs})`);
+		assert(d2Mss === firstMss, `场景6 同事件重复调用 mayHaveSha 不重算(${d2Mss}==${firstMss})`);
+
+		// 手牌结构变化（追加一张明梅花杀）→ 指纹失效重算
+		tgt.node.handcards1.appendChild(game.createCard("sha", "club", 8));
+		lib.config.extension_自用ai_checkopt = false;
+		makeEvent(p0);
+		const offAfter = evalShan(tgt, p0, combos);
+		lib.config.extension_自用ai_checkopt = undefined;
+		makeEvent(p0);
+		const c1 = COUNT_MHS;
+		const onAfter = evalShan(tgt, p0, combos);
+		assert(snap(onAfter) === snap(offAfter), "场景6 手牌变化后 ON/OFF mayHaveShan 一致");
+		assert(COUNT_MHS - c1 === combos.length, `场景6 手牌变化后同事件首次需重算(${COUNT_MHS - c1})`);
+		assert(snap(onAfter) !== snap(onShan), "场景6 手牌变化确实改变估值结果");
+
+		// 体力变化（hp 1，响应 tag 短路分支失效）→ 重算且与 OFF 一致
+		tgt.hp = 1;
+		lib.config.extension_自用ai_checkopt = false;
+		makeEvent(p0);
+		const offHp = evalSha(tgt, p0, combos);
+		lib.config.extension_自用ai_checkopt = undefined;
+		makeEvent(p0);
+		const onHp = evalSha(tgt, p0, combos);
+		assert(snap(onHp) === snap(offHp), "场景6 体力变化后 ON/OFF mayHaveSha 一致");
+		tgt.hp = 3;
+	}
+	lib.config.extension_自用ai_checkopt = undefined;
+}
+
+// 场景 7：8.8 已知手牌缓存 getKnownCards
+//   - 开/关 在 自观(target自身) 与 他观(observer) 下结果一致
+//   - 同事件内重复调用命中缓存（原函数 COUNT_GKC 不涨）
+//   - 手牌结构 / 体力变化 ⇒ 指纹失效 ⇒ 原函数重算，结果仍与 OFF 一致
+{
+	const gmk = makeGame(7788);
+	game.players = gmk.players;
+	const tgt = gmk.players[2];
+	const viewer = gmk.players[1];
+	const evtPlayer = gmk.players[0];
+	tgt.node.handcards1.childNodes.forEach(n => n.remove());
+	for (let i = 0; i < 40; i++) {
+		tgt.node.handcards1.appendChild(game.createCard(fillerNames[i % fillerNames.length], suits[i % 4], ((i * 5) % 13) + 1));
+	}
+	tgt.hp = 3; tgt.maxHp = 5; tgt.hujia = 0; tgt.isZhu = false;
+	viewer.node.handcards1.childNodes.forEach(n => n.remove());
+	viewer.node.handcards1.appendChild(game.createCard("sha", "club", 7));
+	viewer.hp = 3; viewer.maxHp = 4; viewer.hujia = 0; viewer.isZhu = false;
+	const snap2 = (a) => JSON.stringify(a.map(c => c.name + ":" + c.cardid));
+	const evalGkc = (target, obs) => ({
+		self: snap2(target.getKnownCards(target)),
+		obs: snap2(obs.getKnownCards(target)),   // 观察者扫目标手牌（他观）
+	});
+	// 无 other 参数的调用走旁路（get.player() 动态解析），仅做正确性冒烟
+	snap2(viewer.getKnownCards());
+
+	lib.config.extension_自用ai_checkopt = false;
+	makeEvent(evtPlayer);
+	const offGkc = evalGkc(tgt, viewer);
+
+	lib.config.extension_自用ai_checkopt = undefined;
+	makeEvent(evtPlayer);
+	const c0Gkc = COUNT_GKC;
+	const onGkc = evalGkc(tgt, viewer);
+	const firstGkc = COUNT_GKC - c0Gkc;
+	assert(JSON.stringify(onGkc) === JSON.stringify(offGkc), `场景7 ON/OFF getKnownCards 一致(${JSON.stringify(onGkc)} vs ${JSON.stringify(offGkc)})`);
+
+	const repeatGkc = evalGkc(tgt, viewer);
+	const d2Gkc = COUNT_GKC - c0Gkc;
+	assert(JSON.stringify(repeatGkc) === JSON.stringify(onGkc), "场景7 同事件重复调用 getKnownCards 结果稳定");
+	assert(d2Gkc === firstGkc, `场景7 同事件重复调用 getKnownCards 不重算(${d2Gkc}==${firstGkc})`);
+
+	// 手牌结构变化（追加一张）→ 指纹失效重算，且自观结果随之更新
+	tgt.node.handcards1.appendChild(game.createCard("shan", "heart", 1));
+	lib.config.extension_自用ai_checkopt = false;
+	makeEvent(evtPlayer);
+	const offAfter7 = evalGkc(tgt, viewer);
+	lib.config.extension_自用ai_checkopt = undefined;
+	makeEvent(evtPlayer);
+	const c1Gkc = COUNT_GKC;
+	const onAfter7 = evalGkc(tgt, viewer);
+	assert(JSON.stringify(onAfter7) === JSON.stringify(offAfter7), "场景7 手牌变化后 ON/OFF getKnownCards 一致");
+	assert(COUNT_GKC - c1Gkc === firstGkc, `场景7 手牌变化后同事件首次需重算(${COUNT_GKC - c1Gkc})`);
+	assert(onAfter7.self !== onGkc.self, "场景7 自观手牌变化后已知牌列表更新");
+	tgt.node.handcards1.childNodes.forEach(n => n.remove());
+	viewer.node.handcards1.childNodes.forEach(n => n.remove());
+	lib.config.extension_自用ai_checkopt = undefined;
+}
+
+// 场景 8：8.9 顺手/过河 result.target 拆目标判定缓存
+//   - 开/关 在 (顺手,过河) x 多目标下结果一致
+//   - 同一决策事件内重复调用（get.value 按 countPlayer 全扫 + get.effect_use
+//     估值）命中缓存，原判定 COUNT 不再增长
+//   - 目标三区结构/体力变化 ⇒ 指纹失效 ⇒ 原判定重算，结果仍与 OFF 一致
+{
+	const g8 = makeGame(13579);
+	game.players = g8.players;
+	const p8 = g8.players[0];
+	const targets8 = [g8.players[1], g8.players[2], g8.players[3]];
+	targets8.forEach((t, ti) => {
+		t.node.handcards1.childNodes.forEach(n => n.remove());
+		for (let i = 0; i < 40 + ti * 10; i++) {
+			t.node.handcards1.appendChild(game.createCard(fillerNames[i % fillerNames.length], suits[i % 4], ((i * 5) % 13) + 1));
+		}
+		const eq = game.createCard(equipNames[ti * 3 % equipNames.length], suits[ti % 4], ti + 5);
+		t.node.equips.appendChild(eq);
+		t.hp = 3 + ti; t.maxHp = 4 + ti; t.hujia = 0; t.isZhu = false;
+	});
+	p8.node.handcards1.childNodes.forEach(n => n.remove());
+	p8.node.handcards1.appendChild(game.createCard("sha", "club", 7));
+	p8.hp = 3; p8.maxHp = 4; p8.hujia = 0; p8.isZhu = false;
+	// 复刻启动引导的缓存代理配置（get.attitude 走 CacheContext 委托）
+	if (!get.rawAttitude) {
+		get.rawAttitude = (from, to) => {
+			if (!from || !to || !from.ai) return 0;
+			if (from.ai.enemy?.includes(to)) return -5;
+			if (from.ai.friend?.includes(to)) return 5;
+			return 1;
+		};
+	}
+	CacheContext.setProxy({ lib, game, get });
+	CacheContext.setCacheContext(new CacheContext({ lib, game, get }));
+	const ssCard = game.createCard("shunshou", "spade", 7);
+	const ghCard = game.createCard("guohe", "club", 5);
+	// 一次估值：对每个目标跑 get.value(card)（内含 countPlayer 全扫→逐目标
+	// result.target）与 get.effect_use（估值时再次命中同一 result.target）
+	const evalTrick = (dtarget) => ({
+		ssVal: get.value(ssCard, p8),
+		ssEff: get.effect_use(dtarget, ssCard, p8),
+		ghVal: get.value(ghCard, p8),
+		ghEff: get.effect_use(dtarget, ghCard, p8),
+	});
+	const snap8 = (o) => JSON.stringify(o.map((v, i) => [v.ssVal, v.ssEff, v.ghVal, v.ghEff].map((n, k) => { if (n === undefined) throw new Error(`snap8 undefined target=${i} key=${["ssVal","ssEff","ghVal","ghEff"][k]}`); return n.toFixed ? n.toFixed(3) : String(n); })));
+
+	lib.config.extension_自用ai_checkopt = false;
+	makeEvent(p8);
+	const off8 = targets8.map(t => evalTrick(t));
+
+	lib.config.extension_自用ai_checkopt = undefined;
+	makeEvent(p8);
+	const c0Ss = COUNT_SS_RT, c0Gh = COUNT_GH_RT;
+	const on8 = targets8.map(t => evalTrick(t));
+	const firstSs = COUNT_SS_RT - c0Ss;
+	const firstGh = COUNT_GH_RT - c0Gh;
+	assert(snap8(on8) === snap8(off8), `场景8 ON/OFF 顺过估值各目标一致(${snap8(on8)} vs ${snap8(off8)})`);
+	// 首次应恰好为 8：第一个目标做 get.value 时 countPlayer 对全场 8 人各原算一次
+	// result.target，其余目标与 effect_use 估值全部命中缓存
+	assert(firstSs === 8, `场景8 顺手首次每目标原算一次(${firstSs}/8)`);
+	assert(firstGh === 8, `场景8 过河首次每目标原算一次(${firstGh}/8)`);
+
+	// 同一决策事件内重复估值：get.value 按 countPlayer 全扫应全部命中缓存，不重算
+	const repeat8 = targets8.map(t => evalTrick(t));
+	const d2Ss = COUNT_SS_RT - c0Ss, d2Gh = COUNT_GH_RT - c0Gh;
+	assert(snap8(repeat8) === snap8(on8), "场景8 同事件重复估值结果稳定");
+	assert(d2Ss === firstSs, `场景8 同事件重复估值顺手不重算(${d2Ss}==${firstSs})`);
+	assert(d2Gh === firstGh, `场景8 同事件重复估值过河不重算(${d2Gh}==${firstGh})`);
+
+	// 目标判定区追加一张牌 → 三区结构指纹失效，仅在命中目标那一格重算。
+	// 失效必须在同一决策事件内观察：换新事件后首次 get.value 扫描本身就要
+	// 8 次原算，那不是"失效重算"。故先在同事件内暖一次填满缓存，再改判定区，
+	// 断言只有该目标被重算（其余 7 人命中缓存），且重算结果与"带乐不思蜀的
+	// OFF 参照"完全一致。
+	const jt = targets8[0];
+	// OFF 参照（第一名阶段无判定牌）：后续 warmth 应与之等值
+	lib.config.extension_自用ai_checkopt = false;
+	makeEvent(p8);
+	const offJ0 = evalTrick(jt);
+	// ON 暖缓存（同一事件 E 内）
+	lib.config.extension_自用ai_checkopt = undefined;
+	makeEvent(p8);
+	const cWarmSs = COUNT_SS_RT, cWarmGh = COUNT_GH_RT;
+	const warmJ = evalTrick(jt);
+	const warmSs = COUNT_SS_RT - cWarmSs, warmGh = COUNT_GH_RT - cWarmGh;
+	assert(snap8([warmJ]) === snap8([offJ0]), "场景8 同事件首次 ON/OFF 顺过估值一致（暖缓存）");
+	assert(warmSs === 8, `场景8 同事件首次顺过扫描 warm=8(${warmSs})`);
+	assert(warmGh === 8, `场景8 同事件首次过河扫描 warm=8(${warmGh})`);
+	// 仍在事件 E：追加判定牌，仅 jt 的指纹失效
+	jt.node.judges.appendChild(game.createCard("lebu", "diamond", 3));
+	const c1Ss = COUNT_SS_RT, c1Gh = COUNT_GH_RT;
+	const onJ = evalTrick(jt);
+	const invSs = COUNT_SS_RT - c1Ss, invGh = COUNT_GH_RT - c1Gh;
+	// OFF 带判定牌参照（换事件、OFF 模式，原算 8+1 次；不参与 inv 差值）
+	lib.config.extension_自用ai_checkopt = false;
+	makeEvent(p8);
+	const offJ1 = evalTrick(jt);
+	assert(snap8([onJ]) === snap8([offJ1]), "场景8 判定区变化后 ON/OFF 顺过估值一致");
+	assert(invSs === 1, `场景8 判定区变化后顺手仅重算目标一格(${invSs})`);
+	assert(invGh === 1, `场景8 判定区变化后过河仅重算目标一格(${invGh})`);
+	jt.node.judges.childNodes.forEach(n => n.remove());
+	jt.node.handcards1.childNodes.forEach(n => n.remove());
+	jt.node.equips.childNodes.forEach(n => n.remove());
 	lib.config.extension_自用ai_checkopt = undefined;
 }
 
@@ -458,6 +716,18 @@ console.log(
 console.log(
 	`  VCard 真实构造 ${(4320 / 120).toFixed(0)}->${(360 / 120).toFixed(0)} 次/事件（↓92%），` +
 	`getModableSkills 真实重算 ${(60000 / 120).toFixed(0)}->${(30 / 120).toFixed(1)} 次/事件（↓100%）`
+);
+console.log(
+	`  8.7 mayHaveShan/mayHaveSha 真实重算：同事件内 5 参数组首次各 1 次后归 0（重复判定零重算）；` +
+	`手牌/体力变化即自动失效重算。`
+);
+console.log(
+	`  8.8 getKnownCards 已知手牌：同事件内 自观/他观 首次各 1 次后归 0（敌方决策内对同一 ` +
+	`(目标,观察者) 的攻击/响应估计零重扫）；手牌结构变化即自动失效重算。`
+);
+console.log(
+	`  8.9 顺手/过河 result.target 拆目标判定：同事件内每目标首次各原算 1 次后归 0（get.value ` +
+	`按 countPlayer 的全扫 + get.effect_use 估值全部命中缓存）；目标三区结构/体力变化即自动失效重算。`
 );
 console.log(
 	`  jsdom 墙钟开缓存约快 25~30%；真实浏览器中 get.owner 的 DOM 扫描、` +

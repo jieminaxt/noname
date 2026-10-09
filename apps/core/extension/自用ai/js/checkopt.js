@@ -31,6 +31,27 @@ const NS = "checkopt";
 //    (事件,实体牌,参数) 缓存（命中校验 parentNode/removing/feichu/
 //    owner 技能指纹/实体牌 skills 指纹），getModableSkills 按
 //    (事件,玩家) 缓存（校验技能集合指纹）。关闭后回退原函数。
+// 5) 决策期 AI 响应估值缓存：敌方 AI 估算"目标手里有没有闪/杀"时（get.effect_use
+//    → sha 系卡的 mayHaveShan / 决斗与南蛮的 mayHaveSha）对目标手牌做全量扫描，
+//    60+ 手牌下 sha 系单目标估值 6~9ms、决斗约 10ms，且同一决策内对每个可打牌
+//    重复计算。决策事件内目标手牌/技能/体力不变（noname 自身也按事件做
+//    putTempCache），按 (事件,目标,观察者,type,ignore,rvt) 缓存，命中校验
+//    hp/maxHp/hujia/isZhu/手牌结构指纹/技能集合指纹。仅缓存确定性结果（rvt 为
+//     "count"/"odds"），默认布尔分支依赖 getRand 随机数，不缓存。关闭后回退原函数。
+// 6) 决策期已知手牌 getKnownCards 缓存：万箭/南蛮/杀系 AI 的响应估计（canShan/canSha
+//    闭包与部分 getKnownCards 直调）在敌方决策里对同一 (目标,观察者) 反复做 O(手牌)
+//    全扫，60+ 手牌下单次 6~15ms。决策事件内目标手牌与技能集合不变，按
+//    (事件,目标,观察者,过滤器) 缓存，命中校验双方体力/手牌结构/技能集合指纹，任一
+//    变化即失效；命中返回数组副本防调用方改坏缓存。函数/对象过滤器旁路原函数。
+//    关闭后回退原函数。
+// 7) 顺手/过河 AI 拆目标判定缓存：shunshou/guohe 的 ai.result.target 对每个目标做
+//    三区（手牌/装备/判定）可拿/可弃全扫并逐牌估值，get.value 侧按 countPlayer 对
+//    全场角色反复调用，get.effect_use 估值时同样再次命中同一函数，同一决策内对
+//    (玩家,目标) 重复计算。决策事件内目标三区结构/体力/技能集合不变（noname 自身
+//    同样按事件做 putTempCache），按 (事件,玩家,目标) 缓存，命中校验双方体力/技能
+//    集合指纹 + 目标三区结构指纹（手牌数、装备/判定区牌名+cardid+viewAs），任一变化
+//    即失效。仅缓存确定性结果：两函数的判定体均不含 getRand 随机数消耗。关闭后
+//    回退原函数。
 // ============================================================
 
 export function ensureUpdatehlSoon() {
@@ -270,6 +291,12 @@ export function install() {
 
 	// 8.6 决策期 VCard 构造 / modable 技能列表缓存（见文件头注释 4）
 	installViewCache();
+	// 8.7 决策期 AI 响应估值缓存（见文件头注释 5）
+	installResponseEstimateCache();
+	// 8.8 决策期已知手牌缓存（见文件头注释 6）
+	installKnownCardsCache();
+	// 8.9 顺手/过河 AI 拆目标判定缓存（见文件头注释 7）
+	installTrickResultCache();
 }
 
 // 事件级缓存存储：WeakMap 以事件对象为键，事件结束即自动回收
@@ -365,8 +392,199 @@ function installEquipCache() {
 	}, FLAG.checkopt);
 }
 
+// ============================================================
+// 8.7 决策期 AI 响应估值缓存
+// ============================================================
+
+// 事件级缓存：mayHaveShan / mayHaveSha
+const mhsStore = new WeakMap();
+const mssStore = new WeakMap();
+
+function responseStore(storeMap, event) {
+	let store = storeMap.get(event);
+	if (!store) {
+		store = new Map();
+		storeMap.set(event, store);
+	}
+	return store;
+}
+
+function handCountO1(player) {
+	const node = player.node;
+	if (!node) return 0;
+	let n = 0;
+	if (node.handcards1) n += node.handcards1.childNodes.length;
+	if (node.handcards2) n += node.handcards2.childNodes.length;
+	return n;
+}
+
+function installResponseEstimateCache() {
+	if (hasOwn(lib.element.Player.prototype, "mayHaveResponseCached")) {
+		return;
+	}
+	lib.element.Player.prototype.mayHaveResponseCached = true;
+
+	// 8.7.1 player.mayHaveShan / mayHaveSha：敌方 AI 估算"目标手里有没有闪/杀"
+	// 时会对目标手牌做全量扫描（getKnownCards + hs 两轮），60+ 手牌下 sha 系
+	// 单目标估值 6~9ms、决斗 10ms，且同一决策内对每个破坏/响应候选反复重算。
+	// 决策事件内目标手牌与技能集合不变（noname 自身同样按事件做 putTempCache），
+	// 故按 (事件,目标,观察者,type,ignore,rvt) 缓存；命中校验 hp / maxHp / hujia /
+	// isZhu / 手牌结构指纹 / 技能集合指纹，任一变化即失效。只缓存确定性结果
+	// （rvt 为 "count"/"odds"），默认布尔分支依赖 getRand 随机数，不做缓存。
+	function makeResponseEstimateCache(keyNs, storeMap, fnName) {
+		patch(lib.element.Player.prototype, fnName, NS, (original) => function (viewer, type, ignore, rvt) {
+			if (rvt !== "count" && rvt !== "odds") {
+				return original.apply(this, arguments);
+			}
+			const event = _status.event;
+			const ignoreOk = ignore === null || ignore === undefined || typeof ignore === "boolean";
+			if (!event || get.itemtype(viewer) !== "player" || !ignoreOk) {
+				return original.apply(this, arguments);
+			}
+			const me = this;
+			const store = responseStore(storeMap, event);
+			const key = keyNs + "|" + me.playerid + "|" + viewer.playerid + "|" + (type || "") + "|" + String(ignore) + "|" + rvt;
+			const fp = me.hp + "|" + me.maxHp + "|" + me.hujia + "|" + (me.isZhu ? 1 : 0) + "|" + handCountO1(me) + "|" + modableFingerprint(me);
+			const ent = store.get(key);
+			if (ent && ent.fp === fp) {
+				return ent.ret;
+			}
+			const ret = original.apply(this, arguments);
+			store.set(key, { fp, ret });
+			return ret;
+		}, FLAG.checkopt);
+	}
+	makeResponseEstimateCache("shan", mhsStore, "mayHaveShan");
+	makeResponseEstimateCache("sha", mssStore, "mayHaveSha");
+}
+
 function hasOwn(obj, key) {
 	return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+// ============================================================
+// 8.8 决策期已知手牌 getKnownCards 缓存
+// ============================================================
+
+// 事件级缓存：同一决策事件内 getKnownCards(目标,观察者) 结果不变
+const gkcStore = new WeakMap();
+
+// 过滤器参数串化：字符串/数组返回稳定串，函数/对象属调用方现场闭包，不缓存
+function gkcFilterKey(filter) {
+	if (filter === undefined || filter === null) {
+		return "";
+	}
+	if (typeof filter === "string") {
+		return "s:" + filter;
+	}
+	if (Array.isArray(filter)) {
+		return "a:" + filter.join(",");
+	}
+	return null;
+}
+
+function installKnownCardsCache() {
+	if (hasOwn(lib.element.Player.prototype, "getKnownCardsCached")) {
+		return;
+	}
+	lib.element.Player.prototype.getKnownCardsCached = true;
+	// AOE/杀系 AI 的响应估计（wanjian/nanman 的 canShan/canSha 闭包、8.7 之外的
+	// getKnownCards 直调路径）在敌方决策里对 (目标,观察者) 反复做 O(手牌) 全扫，
+	// 60+ 手牌下单次 6~15ms。决策事件内目标手牌与技能集合不变（noname 自身也按
+	// 事件做 putTempCache），按 (事件,目标,观察者,过滤器) 缓存，命中校验体力 / 手牌
+	// 结构 / 双方技能集合指纹，任一变化即失效。命中返回数组副本，避免调用方改坏
+	// 缓存。仅缓存无过滤器或字符串/数组这类稳定过滤器，函数/对象过滤器旁路原函数。
+	patch(lib.element.Player.prototype, "getKnownCards", NS, (original) => function (other, filter) {
+		if (gkcFilterKey(filter) === null) {
+			return original.apply(this, arguments);
+		}
+		const event = _status.event;
+		if (!event || get.itemtype(other) !== "player") {
+			return original.apply(this, arguments);
+		}
+		const me = this;
+		const store = responseStore(gkcStore, event);
+		const key = "gkc|" + me.playerid + "|" + other.playerid + "|" + gkcFilterKey(filter);
+		const fp =
+			me.hp + "|" + me.maxHp + "|" + me.hujia + "|" + (me.isZhu ? 1 : 0) + "|" + handCountO1(me) + "|" +
+			modableFingerprint(me) + "|" + modableFingerprint(other);
+		const ent = store.get(key);
+		if (ent && ent.fp === fp) {
+			return Array.from(ent.ret);
+		}
+		const ret = original.apply(this, arguments);
+		store.set(key, { fp, ret });
+		return ret;
+	}, FLAG.checkopt);
+}
+
+// ============================================================
+// 8.9 顺手/过河 AI 拆目标判定缓存
+// ============================================================
+
+// 事件级缓存存储：WeakMap 以事件对象为键，事件结束即自动回收
+const trickResultStore = new WeakMap();
+
+// 目标三区结构指纹：手牌数 + 装备区/判定区每张牌的 (name,cardid,viewAs)。
+// 覆盖 ai.result.target 对 getGainableCards/getDiscardableCards 三区全扫的
+// 全部判定输入：牌增减、装备/判定变化、viewAs 变化都会改变指纹。
+function trickZoneFingerprint(node) {
+	if (!node || !node.childNodes) return "";
+	let fp = "";
+	for (const c of node.childNodes) {
+		if (!c || !c.name) continue;
+		fp += (fp ? "," : "") + c.name + ":" + (c.cardid || "?") + (c.viewAs ? "#" + c.viewAs : "");
+	}
+	return fp;
+}
+
+function trickResultFingerprint(player, target) {
+	return (
+		player.playerid + "|" + player.hp + "|" + player.maxHp + "|" + player.hujia + "|" + (player.isZhu ? 1 : 0) + "|" +
+		modableFingerprint(player) + "|" +
+		target.playerid + "|" + target.hp + "|" + target.maxHp + "|" + target.hujia + "|" + (target.isZhu ? 1 : 0) + "|" +
+		handCountO1(target) + "|" +
+		trickZoneFingerprint(target.node.equips) + "|" +
+		trickZoneFingerprint(target.node.judges)
+	);
+}
+
+function installTrickResultCache() {
+	if (hasOwn(lib.card.shunshou.ai.result, "targetCached")) {
+		return;
+	}
+	lib.card.shunshou.ai.result.targetCached = true;
+
+	// 8.9.1 shunshou.ai.result.target / guohe.ai.result.target：拆目标判定对
+	// 目标三区做可拿/可弃全扫（getGainableCards/getDiscardableCards → 每张牌
+	// canBeGained/canBeDiscarded 逐 skill mod），get.value 侧按 countPlayer 对
+	// 全场角色反复调用、get.effect_use 估值时再次命中同一函数。决策事件内目标
+	// 三区结构/体力/技能集合不变，按 (事件,玩家,目标) 缓存，命中校验双方体力/
+	// 技能集合指纹 + 目标三区结构指纹，任一变化即失效。判定体不含 getRand，结果
+	// 确定可缓存。关闭后回退原函数。
+	function makeTrickResultCache(name, obj) {
+		// 注意：patch/backup 的去重键是 ns+":"+key，不含对象。game.Check.target
+		// 已占用 "checkopt:target"，故此处必须用独立命名空间，否则会被误判为
+		// 已打补丁而静默跳过。
+		patch(obj, "target", NS + ".trick." + name, (original) => function (player, target) {
+			const event = _status.event;
+			if (!event || get.itemtype(player) !== "player" || get.itemtype(target) !== "player") {
+				return original.apply(this, arguments);
+			}
+			const store = responseStore(trickResultStore, event);
+			const key = name + "|" + player.playerid + "|" + target.playerid;
+			const fp = trickResultFingerprint(player, target);
+			const ent = store.get(key);
+			if (ent && ent.fp === fp) {
+				return ent.ret;
+			}
+			const ret = original.apply(this, arguments);
+			store.set(key, { fp, ret });
+			return ret;
+		}, FLAG.checkopt);
+	}
+	makeTrickResultCache("shunshou", lib.card.shunshou.ai.result);
+	makeTrickResultCache("guohe", lib.card.guohe.ai.result);
 }
 
 // ============================================================
