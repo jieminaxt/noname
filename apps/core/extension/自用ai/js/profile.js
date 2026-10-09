@@ -14,6 +14,8 @@ const dumpLines = [];
 const DUMP_PATH = "extension/自用ai/ai-perf-dump.txt";
 const DUMP_LS_KEY = "extension_自用ai_perf_dump";
 const DUMP_MAX_LINES = 5000;
+// 单卡估值最慢采样：chooseCard 循环内每张候选牌 check 的耗时
+let cardCheckTop = { card: null, ms: 0 };
 
 export function bindProfileFlag(fn) {
 	profFlag = fn;
@@ -29,8 +31,15 @@ function dumpCollect(line) {
 }
 
 async function dumpFlush() {
-	if (!dumpLines.length) return;
-	const text = "自用ai 性能落盘 " + new Date().toISOString() + "\n" + dumpLines.join("\n") + "\n";
+	if (!dumpLines.length && !cardCheckTop.ms) return;
+	const header = "自用ai 性能落盘 " + new Date().toISOString();
+	let text = header + "\n" + dumpLines.join("\n");
+	if (cardCheckTop.ms) {
+		const c = cardCheckTop;
+		let desc = typeof c.card === "string" ? "技能:" + c.card : (c.card && c.card.name ? c.card.name : "?");
+		text += "\n[单卡最慢] " + desc + " " + c.ms.toFixed(1) + "ms\n";
+	}
+	text += "\n";
 	let ok = false;
 	// 真机(Cordova)首选：game.writeFile 写入扩展目录 extension/自用ai/ai-perf-dump.txt
 	if (!ok && game && typeof game.writeFile === "function") {
@@ -104,4 +113,11 @@ export function profWrap(label, fn) {
 // 供 extension 定时调用：把累积行落盘
 export function profFlushNow() {
 	return dumpFlush();
+}
+
+// chooseCard 循环内单卡估值采样：记录本局最慢的单张候选估值
+export function profCardCheck(card, ms) {
+	if (ms > cardCheckTop.ms) {
+		cardCheckTop = { card, ms };
+	}
 }

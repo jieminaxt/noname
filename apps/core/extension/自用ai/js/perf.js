@@ -1,7 +1,7 @@
 import { lib, game, ui, get, ai, _status } from "../../../noname.js";
 import { CacheContext } from "../../../noname/library/cache/cacheContext.js";
 import { FLAG, patch, backup } from "./core.js";
-import { profOn, profCount, profAdd } from "./profile.js";
+import { profOn, profCount, profAdd, profCardCheck } from "./profile.js";
 
 const NS = "perf";
 
@@ -473,9 +473,13 @@ export function installChooseRewrite() {
 				let ix = 0;
 				enterCache();
 				try {
+					const perCardT0 = profEnabled ? performance.now() : 0;
 					let maxVal = check(cards[0], cards2);
+					if (profEnabled) profCardCheck(cards[0], performance.now() - perCardT0);
 					for (let i = 1; i < cards.length; i++) {
+						const perT0 = profEnabled ? performance.now() : 0;
 						const val = check(cards[i], cards2);
+						if (profEnabled) profCardCheck(cards[i], performance.now() - perT0);
 						if (val > maxVal) {
 							ix = i;
 							maxVal = val;
