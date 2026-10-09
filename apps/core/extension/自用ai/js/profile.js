@@ -1,14 +1,63 @@
-import { game } from "../../../noname.js";
+import { game, lib } from "../../../noname.js";
 
 // ============================================================
 // AI 性能分析器
 // 配置开启后统计各环节累计耗时，超过 50ms 输出到游戏日志和控制台
+// dumpfile 开启时：把 "AI耗时" 峰值行累积写入扩展目录文件，
+// 供真机大量手牌场景导出分析（fs 不可用则回退 localStorage）
 // ============================================================
 const profState = { pending: 0, times: new Map(), counts: new Map() };
 let profFlag = () => false;
+let dumpFlag = () => false;
+let dumpTimer = null;
+const dumpLines = [];
+const DUMP_PATH = "extension/自用ai/ai-perf-dump.txt";
+const DUMP_LS_KEY = "extension_自用ai_perf_dump";
+const DUMP_MAX_LINES = 5000;
 
 export function bindProfileFlag(fn) {
 	profFlag = fn;
+}
+
+export function bindDumpFlag(fn) {
+	dumpFlag = fn;
+}
+
+function dumpCollect(line) {
+	dumpLines.push(line);
+	if (dumpLines.length > DUMP_MAX_LINES) dumpLines.splice(0, dumpLines.length - DUMP_MAX_LINES);
+}
+
+async function dumpFlush() {
+	if (!dumpLines.length) return;
+	const text = "自用ai 性能落盘 " + new Date().toISOString() + "\n" + dumpLines.join("\n") + "\n";
+	let ok = false;
+	// 真机(Cordova)首选：game.writeFile 写入扩展目录 extension/自用ai/ai-perf-dump.txt
+	if (!ok && game && typeof game.writeFile === "function") {
+		try {
+			await new Promise((resolve) => {
+				game.writeFile(new TextEncoder().encode(text).buffer, "extension/自用ai/", "ai-perf-dump.txt", () => resolve());
+			});
+			ok = true;
+		} catch (e) {
+			try { game.log("[自用ai] 性能落盘 writeFile 失败：" + String(e.message || e).slice(0, 80)); } catch (e2) { }
+		}
+	}
+	// 桌面/其它：lib.fs.writeText
+	if (!ok && lib.fs && typeof lib.fs.writeText === "function") {
+		try {
+			await lib.fs.writeText(DUMP_PATH, text);
+			ok = true;
+		} catch (e) {
+			try { game.log("[自用ai] 性能落盘 fs 失败：" + String(e.message || e).slice(0, 80)); } catch (e2) { }
+		}
+	}
+	// 最终回退：localStorage
+	if (!ok) {
+		try {
+			localStorage.setItem(DUMP_LS_KEY, text);
+		} catch (e) { }
+	}
 }
 
 export function profOn() {
@@ -32,6 +81,7 @@ export function profAdd(label, ms) {
 		try {
 			game.log(line);
 		} catch (e) { }
+		if (dumpFlag()) dumpCollect(line);
 		profState.pending = 0;
 		profState.times.clear();
 		profState.counts.clear();
@@ -49,4 +99,9 @@ export function profWrap(label, fn) {
 			profCount(label + "调用");
 		}
 	};
+}
+
+// 供 extension 定时调用：把累积行落盘
+export function profFlushNow() {
+	return dumpFlush();
 }

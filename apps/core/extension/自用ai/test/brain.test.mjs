@@ -129,7 +129,7 @@ ok("lib/game/get/ui/_status 存在", lib && game && get && ui && _status);
 const e = ext();
 ok("扩展名", e.name === "自用ai");
 ok("版本", e.package?.version === "2.0");
-ok("四开关配置", Object.keys(e.config).length === 4);
+ok("四开关配置", Object.keys(e.config).length === 5);
 ok("precontent 函数", typeof e.precontent === "function");
 
 console.log("===== 2. FLAG 开关语义 =====");

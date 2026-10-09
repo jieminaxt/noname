@@ -1,5 +1,5 @@
 import { lib, game, ui, get, ai, _status } from "../../noname.js";
-import { bindProfileFlag } from "./js/profile.js";
+import { bindProfileFlag, bindDumpFlag, profFlushNow } from "./js/profile.js";
 import { installFuncKeyCache, installMemoLayer, installSelectableCache, installChooseRewrite } from "./js/perf.js";
 import { install as installCheckopt } from "./js/checkopt.js";
 import { installBrain } from "./js/brain.js";
@@ -23,6 +23,10 @@ export default function () {
 			installCheckopt();
 			installBrain();
 			bindProfileFlag(() => lib.config.extension_自用ai_aiprofile === true);
+			bindDumpFlag(() => lib.config.extension_自用ai_dumpfile === true);
+			if (lib.config.extension_自用ai_dumpfile === true) {
+				setInterval(() => { profFlushNow(); }, 30000);
+			}
 		},
 		config: {
 			onai: {
@@ -43,6 +47,11 @@ export default function () {
 			aiprofile: {
 				name: "ai耗时统计",
 				intro: "决策耗时超过50ms时在控制台与游戏日志输出分项耗时；默认关闭",
+				init: false,
+			},
+			dumpfile: {
+				name: "性能落盘(真机导出)",
+				intro: "配合ai耗时统计：把峰值行累积写入扩展目录 extension/自用ai/ai-perf-dump.txt（fs不可用回退localStorage，键 extension_自用ai_perf_dump）；每30s与对局结束刷新一次。真机验证后用文本发回分析",
 				init: false,
 			},
 		},
