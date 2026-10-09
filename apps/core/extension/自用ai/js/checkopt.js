@@ -46,12 +46,18 @@ const NS = "checkopt";
 //    关闭后回退原函数。
 // 7) 顺手/过河 AI 拆目标判定缓存：shunshou/guohe 的 ai.result.target 对每个目标做
 //    三区（手牌/装备/判定）可拿/可弃全扫并逐牌估值，get.value 侧按 countPlayer 对
-//    全场角色反复调用，get.effect_use 估值时同样再次命中同一函数，同一决策内对
+//    全场角色反复调用，get.effect_use 估值时再次同样命中同一函数，同一决策内对
 //    (玩家,目标) 重复计算。决策事件内目标三区结构/体力/技能集合不变（noname 自身
 //    同样按事件做 putTempCache），按 (事件,玩家,目标) 缓存，命中校验双方体力/技能
 //    集合指纹 + 目标三区结构指纹（手牌数、装备/判定区牌名+cardid+viewAs），任一变化
 //    即失效。仅缓存确定性结果：两函数的判定体均不含 getRand 随机数消耗。关闭后
 //    回退原函数。
+// 8) getCardIndex 事件级索引缓存：get.value 对每张候选牌各调一次 player.getCardIndex
+//    ("hs", name, card, 5)，内部按 iterableGetCards 线性扫描同名牌。80 手牌时每次
+//    决策对全部候选牌各扫一遍=O(手牌²)。决策事件内手牌区结构/技能集合不变，按
+//    (事件,玩家,区域) 建立一次同名牌索引（name → 牌序数组），后续 O(1) 查该牌在
+//    同名牌中的序号；命中校验手牌结构指纹（手牌数+首尾牌引用）+ 技能集合指纹，
+//    任一变化即失效重建。关闭后回退原函数。
 // ============================================================
 
 export function ensureUpdatehlSoon() {
@@ -297,6 +303,8 @@ export function install() {
 	installKnownCardsCache();
 	// 8.9 顺手/过河 AI 拆目标判定缓存（见文件头注释 7）
 	installTrickResultCache();
+	// 8.10 决策期 getCardIndex 索引缓存（见文件头注释 8）
+	installCardIndexCache();
 }
 
 // 事件级缓存存储：WeakMap 以事件对象为键，事件结束即自动回收
@@ -726,5 +734,114 @@ function installViewCache() {
 		const skills = original.apply(this, arguments);
 		store.set(this, { fp, skills });
 		return skills;
+	}, FLAG.checkopt);
+}
+
+// ============================================================
+// 8.10 决策期 getCardIndex 索引缓存
+// get.value 对每张候选牌各调一次 player.getCardIndex("hs", name, card, 5)，
+// 内部按 iterableGetCards 线性扫描该玩家的同名牌。大量手牌（60+）时每次
+// 决策对所有候选牌各扫一遍 = O(手牌²)。决策事件内手牌区结构与技能集合不
+// 变，按 (事件,玩家,区域) 单次扫描建立同名牌索引，后续 getCardIndex 用
+// 牌到同名牌序号的 O(1) 映射直接给出结果；命中校验手牌结构指纹（各区
+// childNodes 数量 + 首尾牌 cardid）+ 技能集合指纹，任一变化即失效重建。
+// ============================================================
+
+const gciStore = new WeakMap();
+
+// 覆盖区字符 → 命中的 DOM 节点（与 iterableGetCards 的分支一致）
+function gciZoneNodes(player, arg1) {
+	const n = player.node;
+	const nodes = [];
+	const added = new Set();
+	for (const z of arg1) {
+		let list;
+		if (z === "h" || z === "s") list = [n.handcards1, n.handcards2];
+		else if (z === "e") list = [n.equips];
+		else if (z === "j") list = [n.judges];
+		else if (z === "x") list = [n.expansions];
+		else continue;
+		for (const nd of list) {
+			if (nd && !added.has(nd)) {
+				added.add(nd);
+				nodes.push(nd);
+			}
+		}
+	}
+	return nodes;
+}
+
+// O(区数量) 手牌结构指纹：childNodes 数量 + 首尾牌 cardid
+function gciZoneFingerprint(player, arg1) {
+	const nodes = gciZoneNodes(player, arg1);
+	let fp = "";
+	for (const nd of nodes) {
+		const cn = nd.childNodes;
+		if (!cn || !cn.length) {
+			fp += "0|";
+			continue;
+		}
+		const first = cn[0];
+		const last = cn[cn.length - 1];
+		fp += cn.length + "_" + (first.cardid || "?") + "_" + (last.cardid || "?") + "|";
+	}
+	return fp;
+}
+
+function installCardIndexCache() {
+	if (hasOwn(lib.element.Player.prototype, "gciCached")) {
+		return;
+	}
+	lib.element.Player.prototype.gciCached = true;
+	// getCardIndex(arg1, name, card, max)：返回 card 在 arg1 区同名牌中的
+	// 序号（0 基）；若同名牌达到 max 张且 card 不在前 max 内则返回 max；
+	// 否则返回 -1。见 get/index.js:6680 的唯一调用（max=5）。
+	patch(lib.element.Player.prototype, "getCardIndex", NS, (original) => function (arg1, name, card, max) {
+		const event = _status.event;
+		if (!event || typeof arg1 != "string" || !arg1 || typeof name != "string" || typeof max != "number" || max <= 0) {
+			return original.apply(this, arguments);
+		}
+		let pstore = gciStore.get(event);
+		if (!pstore) {
+			pstore = new Map();
+			gciStore.set(event, pstore);
+		}
+		let entry = pstore.get(this);
+		const argKey = arg1;
+		const fp = argKey + "|" + gciZoneFingerprint(this, arg1) + "|" + modableFingerprint(this);
+		if (!entry || entry.fp !== fp) {
+			entry = { fp, args: argKey, groups: new Map(), relIndex: new Map(), cardName: new Map() };
+			// 单次全扫：同名牌分组（name → 牌序数组），并为每张牌记其在组内序号
+			for (const item of this.iterableGetCards(arg1)) {
+				let groupName;
+				try {
+					groupName = get.name(item);
+				} catch (e) {
+					groupName = typeof item == "object" && item ? item.name : "";
+				}
+				if (!groupName) continue;
+				let group = entry.groups.get(groupName);
+				if (!group) {
+					group = [];
+					entry.groups.set(groupName, group);
+				}
+				entry.relIndex.set(item, group.length);
+				entry.cardName.set(item, groupName);
+				group.push(item);
+			}
+			pstore.set(this, entry);
+		}
+		const ri = entry.relIndex.get(card);
+		if (ri !== undefined) {
+			// 原函数以 get.name(item) == name 匹配；若卡名被 checkMod 改写
+			// （get.name(item) != 传入的 name），该卡在原函数中不会被命中，
+			// 需与"不在同名牌内"同等处理，故先校验卡实际组名一致。
+			if (entry.cardName.get(card) === name) {
+				return ri < max ? ri : max;
+			}
+		}
+		const group = entry.groups.get(name);
+		const total = group ? group.length : 0;
+		return total >= max ? max : -1;
 	}, FLAG.checkopt);
 }
