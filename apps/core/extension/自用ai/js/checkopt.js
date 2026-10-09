@@ -525,6 +525,11 @@ function installKnownCardsCache() {
 // 事件级缓存存储：WeakMap 以事件对象为键，事件结束即自动回收
 const trickResultStore = new WeakMap();
 
+// 防重入标记：真实时序中扩展 precontent 先于卡牌包加载（importCardPack），
+// 此时 lib.card.shunshou 尚不存在，需挂到 lib.onload（boot 在卡牌加载完成
+// 后消费）延迟安装；不能用对象属性标记（对象本身还不存在），故用模块级标记。
+let trickResultCacheInstalled = false;
+
 // 目标三区结构指纹：手牌数 + 装备区/判定区每张牌的 (name,cardid,viewAs)。
 // 覆盖 ai.result.target 对 getGainableCards/getDiscardableCards 三区全扫的
 // 全部判定输入：牌增减、装备/判定变化、viewAs 变化都会改变指纹。
@@ -550,10 +555,23 @@ function trickResultFingerprint(player, target) {
 }
 
 function installTrickResultCache() {
-	if (hasOwn(lib.card.shunshou.ai.result, "targetCached")) {
+	// 真实浏览器时序：扩展 precontent 远早于 importCardPack，标准卡牌定义
+	// （lib.card.shunshou/guohe）尚未注入。卡牌未就绪时不能直接 patch，
+	// 挂 lib.onload 延迟到卡牌加载完成后再装；若 onload 也已被消费（说明
+	// 启动早已完成、卡牌必然已就绪），则不再重试（该路径只会在测试等
+	// 手工 loadCard 场景命中，届时 shunshou 已存在直接走下方正常安装）。
+	const shCard = lib.card && lib.card.shunshou;
+	const ghCard = lib.card && lib.card.guohe;
+	if (!shCard || !ghCard || !shCard.ai || !ghCard.ai || !shCard.ai.result || !ghCard.ai.result) {
+		if (Array.isArray(lib.onload)) {
+			lib.onload.push(installTrickResultCache);
+		}
 		return;
 	}
-	lib.card.shunshou.ai.result.targetCached = true;
+	if (trickResultCacheInstalled) {
+		return;
+	}
+	trickResultCacheInstalled = true;
 
 	// 8.9.1 shunshou.ai.result.target / guohe.ai.result.target：拆目标判定对
 	// 目标三区做可拿/可弃全扫（getGainableCards/getDiscardableCards → 每张牌
