@@ -22,6 +22,15 @@ const NS = "checkopt";
 //    parentNode/removing/feichu/emptyequip 状态，状态变化即失效），
 //    并按 (事件,玩家,候选牌,replace) 缓存 canEquip 结果（校验装备
 //    数量与槽位指纹）。关闭后回退原函数。
+// 4) 决策期 VCard / modable 技能列表缓存：每次 filterCard 都会把
+//    候选实体牌转成 VCard（cardEnabled/cardUsable 各一次），VCard
+//    构造函数对每个属性走 get.name/suit/color/number/nature →
+//    game.checkMod；而 checkMod 默认分支每次重算玩家 modable 技能
+//    列表（getSkills+expandSkills+filter+sort）。60+ 手牌场景这两条
+//    链是决策耗时大头，且同一决策事件内结果稳定：VCard 按
+//    (事件,实体牌,参数) 缓存（命中校验 parentNode/removing/feichu/
+//    owner 技能指纹/实体牌 skills 指纹），getModableSkills 按
+//    (事件,玩家) 缓存（校验技能集合指纹）。关闭后回退原函数。
 // ============================================================
 
 export function ensureUpdatehlSoon() {
@@ -258,6 +267,9 @@ export function install() {
 	// 按 (事件, 玩家, 候选牌, replace) 缓存。均校验状态指纹，状态
 	// 变化（牌移动 / 装备增减 / 槽位切换）即失效，保证正确性。
 	installEquipCache();
+
+	// 8.6 决策期 VCard 构造 / modable 技能列表缓存（见文件头注释 4）
+	installViewCache();
 }
 
 // 事件级缓存存储：WeakMap 以事件对象为键，事件结束即自动回收
@@ -355,4 +367,128 @@ function installEquipCache() {
 
 function hasOwn(obj, key) {
 	return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+// ============================================================
+// 8.6 决策期 VCard / modable 技能列表缓存
+// ============================================================
+
+// 事件级缓存存储：WeakMap 以事件对象为键，事件结束即自动回收
+const vcardStore = new WeakMap();
+const modableStore = new WeakMap();
+
+function hasCardClass(card, name) {
+	return card.classList ? (card.classListContains ? card.classListContains(name) : card.classList.contains(name)) : false;
+}
+
+function objectKeys(fp, obj) {
+	if (obj) fp += "|" + Object.keys(obj).join(",");
+	return fp;
+}
+
+// 玩家技能集合指纹：覆盖 getSkills/filterSkills 的全部输入集合。
+// 集合内容变化（技能增删 / 禁用 / 封禁 / 装备变化）→ 指纹变化 → 缓存失效。
+function modableFingerprint(player) {
+	let fp = (player.skills || []).join(",");
+	fp = objectKeys(fp, player.additionalSkills);
+	fp = objectKeys(fp, player.tempSkills);
+	fp = objectKeys(fp, player.forbiddenSkills);
+	fp = objectKeys(fp, player.disabledSkills);
+	if (player.hiddenSkills && player.hiddenSkills.length) fp += "|h" + player.hiddenSkills.join(",");
+	if (player.invisibleSkills && player.invisibleSkills.length) fp += "|i" + player.invisibleSkills.join(",");
+	const blocker = player.storage && player.storage.skill_blocker;
+	if (blocker && blocker.length) fp += "|b" + blocker.join(",");
+	const es = (player.vcardsMap && player.vcardsMap.equips) || [];
+	if (es.length) fp += "|e" + es.map(c => c.name + ":" + c.cardid).join(",");
+	return fp;
+}
+
+function autoViewAsKey(card, cards, owner) {
+	let c = "u";
+	if (cards === "card") c = "c";
+	else if (cards === false) c = "0";
+	else if (typeof cards === "string") c = "s:" + cards;
+	let o = "u";
+	if (owner === false) o = "0";
+	else if (owner && owner.playerid) o = "p:" + owner.playerid;
+	return card.cardid + "|" + c + "|" + o;
+}
+
+// VCard 构造时套用的 owner：显式 player → 用之；owner=false → 无 owner（不套
+// checkMod）；否则解析实体牌实际归属（走 8.5 get.owner 缓存，事件内免费）。
+function vcardOwner(owner, card) {
+	if (owner === false) return false;
+	if (owner && owner.playerid) return owner;
+	return get.owner(card) || false;
+}
+
+function installViewCache() {
+	if (hasOwn(get, "autoViewAsCached")) {
+		return;
+	}
+	get.autoViewAsCached = true;
+
+	// 8.6.1 get.autoViewAs：实体牌 → VCard 的确定性构造按
+	// (事件, 实体牌, 参数) 缓存。命中校验 parentNode / removing /
+	// feichu / owner 技能指纹 / 实体牌 skills 指纹，任一变化（牌
+	// 移动 / 失去 / 技能增删）即失效重建，保证正确性。命中返回
+	// 浅克隆（字段值复用缓存、cards/skills/storage 重新拷引用），
+	// 防止技能侧对返回 VCard 的属性写入泄漏到后续调用。
+	patch(get, "autoViewAs", NS, (original) => function (card, cards, owner) {
+		if (!(card instanceof lib.element.Card) || (cards !== undefined && cards !== "card" && cards !== false)) {
+			return original.apply(this, arguments);
+		}
+		const event = _status.event;
+		if (!event || !card.parentNode) {
+			return original.apply(this, arguments);
+		}
+		const removing = hasCardClass(card, "removing");
+		const feichu = hasCardClass(card, "feichu");
+		if (removing || feichu) {
+			return original.apply(this, arguments);
+		}
+		let store = vcardStore.get(event);
+		if (!store) {
+			store = new Map();
+			vcardStore.set(event, store);
+		}
+		const key = autoViewAsKey(card, cards, owner);
+		const ent = store.get(key);
+		const realOwner = vcardOwner(owner, card);
+		const modfp = realOwner ? modableFingerprint(realOwner) : "";
+		const skillsfp = card.skills ? card.skills.join(",") : "";
+		if (ent && ent.parent === card.parentNode && ent.removing === removing && ent.feichu === feichu && ent.modfp === modfp && ent.skillsfp === skillsfp) {
+			const clone = Object.assign({}, ent.vcard);
+			clone.cards = ent.vcard.cards ? ent.vcard.cards.slice() : [];
+			clone.skills = ent.vcard.skills ? ent.vcard.skills.slice() : [];
+			clone.storage = Object.assign({}, ent.vcard.storage);
+			return clone;
+		}
+		const vcard = original.apply(this, arguments);
+		store.set(key, { parent: card.parentNode, removing, feichu, modfp, skillsfp, vcard });
+		return vcard;
+	}, FLAG.checkopt);
+
+	// 8.6.2 player.getModableSkills：checkMod 默认分支每次重算 modable
+	// 技能列表（getSkills+expandSkills+filter+sort），是 VCard 构造之外的
+	// 第二个热点。同一事件内技能集合未变时直接复用数组；指纹变化即重算。
+	patch(lib.element.Player.prototype, "getModableSkills", NS, (original) => function () {
+		const event = _status.event;
+		if (!event) {
+			return original.apply(this, arguments);
+		}
+		let store = modableStore.get(event);
+		if (!store) {
+			store = new Map();
+			modableStore.set(event, store);
+		}
+		const fp = modableFingerprint(this);
+		const ent = store.get(this);
+		if (ent && ent.fp === fp) {
+			return ent.skills;
+		}
+		const skills = original.apply(this, arguments);
+		store.set(this, { fp, skills });
+		return skills;
+	}, FLAG.checkopt);
 }

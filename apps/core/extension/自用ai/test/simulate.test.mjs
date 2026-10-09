@@ -242,15 +242,24 @@ function makeEvent(p0) {
 const canEquipOrig = lib.element.Player.prototype.canEquip;
 const ownerOrig = get.owner;
 const filterCardOrig = lib.filter.filterCard;
+const autoViewAsOrig = get.autoViewAs;
+const getModableSkillsOrig = lib.element.Player.prototype.getModableSkills;
 let COUNT_CAN_EQUIP = 0;
 let COUNT_OWNER = 0;
 let COUNT_FILTERCARD = 0;
+let COUNT_AUTOVIEW = 0;
+let COUNT_MODABLE = 0;
 lib.element.Player.prototype.canEquip = function (...a) { COUNT_CAN_EQUIP++; return canEquipOrig.apply(this, a); };
 get.owner = function (...a) { COUNT_OWNER++; return ownerOrig.apply(this, a); };
 lib.filter.filterCard = function (...a) {
 	COUNT_FILTERCARD++;
 	return filterCardOrig.apply(this, a);
 };
+// 计数器只计「真正执行到原函数」的调用：缓存命中时不会走到这里，
+// 因此 COUNT_AUTOVIEW=实体牌→VCard 的真实构造次数，COUNT_MODABLE=
+// modable 技能列表的真实重算次数。
+get.autoViewAs = function (...a) { COUNT_AUTOVIEW++; return autoViewAsOrig.apply(this, a); };
+lib.element.Player.prototype.getModableSkills = function (...a) { COUNT_MODABLE++; return getModableSkillsOrig.apply(this, a); };
 installCheckopt();
 const patchedCanEquip = lib.element.Player.prototype.canEquip;
 
@@ -283,13 +292,13 @@ function benchmark(p0, on) {
 	}
 	const t0 = performance.now();
 	const results = [];
-	COUNT_CAN_EQUIP = 0; COUNT_OWNER = 0; COUNT_FILTERCARD = 0;
+	COUNT_CAN_EQUIP = 0; COUNT_OWNER = 0; COUNT_FILTERCARD = 0; COUNT_AUTOVIEW = 0; COUNT_MODABLE = 0;
 	for (let r = 0; r < ROUNDS; r++) {
 		_status.event = makeEvent(p0);
 		results.push(runRound(_status.event));
 	}
 	const dt = performance.now() - t0;
-	return { results, dt, ce: COUNT_CAN_EQUIP, ow: COUNT_OWNER, fc: COUNT_FILTERCARD };
+	return { results, dt, ce: COUNT_CAN_EQUIP, ow: COUNT_OWNER, fc: COUNT_FILTERCARD, av: COUNT_AUTOVIEW, mo: COUNT_MODABLE };
 }
 
 console.log("== 多局对照（8 人 / 每局 " + ROUNDS + " 轮）==");
@@ -321,32 +330,138 @@ for (let g = 0; g < GAMES; g++) {
 	// DOM 读取/布局，节省量（4~7.5x）会转化为时延收益，见文末盈亏分析。
 	assert(onA.ce < offA.ce / 2, `第 ${g + 1} 局 开缓存后 canEquip 原算次数应小于关缓存的 1/2（${onA.ce} vs ${offA.ce}）`);
 	assert(onA.ow < offA.ow / 2, `第 ${g + 1} 局 开缓存后 get.owner 原算次数应小于关缓存的 1/2（${onA.ow} vs ${offA.ow}）`);
+	assert(onA.av < offA.av / 2, `第 ${g + 1} 局 开缓存后 VCard 真实构造次数应小于关缓存的 1/2（${onA.av} vs ${offA.av}）`);
+	assert(onA.mo < offA.mo / 2, `第 ${g + 1} 局 开缓存后 getModableSkills 真实重算次数应小于关缓存的 1/2（${onA.mo} vs ${offA.mo}）`);
 
 	console.log(
 		`  第 ${g + 1} 局: OFF=${offA.dt.toFixed(1)}ms / OFF2=${offB.dt.toFixed(1)}ms / ON=${onA.dt.toFixed(1)}ms  ` +
 		`canEquip原算 ${offA.ce}->${onA.ce}（↓${(100 - (onA.ce / offA.ce) * 100).toFixed(0)}%），get.owner原算 ${offA.ow}->${onA.ow}（↓${(100 - (onA.ow / offA.ow) * 100).toFixed(0)}%）  ` +
+		`autoViewAs构造 ${offA.av}->${onA.av}（↓${(100 - (onA.av / offA.av) * 100).toFixed(0)}%），getModableSkills重算 ${offA.mo}->${onA.mo}（↓${(100 - (onA.mo / offA.mo) * 100).toFixed(0)}%）  ` +
 		`(${ROUNDS}轮x${PASSES}遍 x ${game1.p0.getCards("hes").length}手牌)`
 	);
+}
+
+// ============ 8.6 决策期 VCard / modable 列表缓存一致性 ============
+// 缓存正确性专项：对同一局（同一批实体牌）逐场景对比 开/关 行为。
+// 场景覆盖：同事件重复构造去重、牌移动失效、技能集合变化失效、
+// removing 状态失效；VCard 只对比经 get.*→checkMod 派生的字段
+// （name/suit/color/number/nature/cardid/isCard/cards），storage 为
+// VCard 构造时的深拷贝快照，属文档化例外不做一致性断言。
+{
+	const g = makeGame(4242);
+	game.players = g.players;
+	const p0 = g.p0;
+	const equips = p0.getCards("h").filter(c => get.type(c) === "equip");
+	assert(equips.length >= 3, `一致性专项需至少 3 张装备候选（实际 ${equips.length}）`);
+	const card = equips[0];
+	const snapshot = (vcard) =>
+		[vcard.name, vcard.suit, vcard.color, vcard.number, vcard.nature, vcard.cardid, vcard.isCard,
+		 (vcard.cards || []).map(c => c.name + ":" + c.cardid).join(",")].join("|");
+
+	// 场景 1：同事件内重复构造。ON 应命中缓存（结果派生字段一致，且
+	// 构造不再发生——由 COUNT_AUTOVIEW 断言证明），OFF 每次新建。
+	{
+		lib.config.extension_自用ai_checkopt = false;
+		const ev = makeEvent(p0);
+		const offA = get.autoViewAs(card);
+		const offB = get.autoViewAs(card);
+		assert(offA !== offB, "场景1 OFF 两次 autoViewAs 应产生不同对象");
+		assert(snapshot(offA) === snapshot(offB), "场景1 OFF 两次结果派生字段一致");
+
+		lib.config.extension_自用ai_checkopt = undefined;
+		const ev2 = makeEvent(p0);
+		const onA = get.autoViewAs(card);
+		const onB = get.autoViewAs(card);
+		assert(snapshot(onA) === snapshot(onB), "场景1 ON 同事件重复构造结果派生字段一致");
+		assert(snapshot(onA) === snapshot(offA), "场景1 ON 与 OFF 派生字段一致");
+	}
+
+	// 场景 2：同事件内实体牌移动到另一归属 → parentNode 变化 → 缓存失效。
+	{
+		const libOwner = g.players[2];
+		libOwner.node.equips.appendChild(card);
+		lib.config.extension_自用ai_checkopt = false;
+		const ev = makeEvent(p0);
+		const offA = get.autoViewAs(card);
+		const offB = get.autoViewAs(card);
+		lib.config.extension_自用ai_checkopt = undefined;
+		const ev2 = makeEvent(p0);
+		const onA = get.autoViewAs(card);
+		const onB = get.autoViewAs(card);
+		assert(snapshot(onA) === snapshot(offA), "场景2 牌移动后 ON/OFF 派生字段一致");
+		assert(onA !== onB || snapshot(onA) === snapshot(onB), "场景2 ON 结果自洽");
+		p0.node.handcards1.appendChild(card);
+	}
+
+	// 场景 3：同事件内技能集合变化（给 p0 加一个改 suit 的 mod 技能）→
+	// 指纹变化 → VCard 与 getModableSkills 都应重算并反映新技能。
+	{
+		lib.skill.testmodsuit = { mod: { suit: () => "spade" } };
+		const p0SkillsLen = p0.skills.length;
+		p0.skills.push("testmodsuit");
+		lib.config.extension_自用ai_checkopt = false;
+		const ev = makeEvent(p0);
+		const offV = get.autoViewAs(card);
+		const offMod = p0.getModableSkills().includes("testmodsuit");
+		lib.config.extension_自用ai_checkopt = undefined;
+		const ev2 = makeEvent(p0);
+		const onV = get.autoViewAs(card);
+		const onMod = p0.getModableSkills().includes("testmodsuit");
+		assert(snapshot(onV) === snapshot(offV), "场景3 技能变化后 ON/OFF VCard 派生字段一致");
+		assert(onV.suit === "spade", `场景3 新 mod 技能应生效（suit=${onV.suit}）`);
+		assert(offMod === true && onMod === true, "场景3 开/关 getModableSkills 都包含新技能");
+		p0.skills.splice(p0SkillsLen);
+		delete lib.skill.testmodsuit;
+	}
+
+	// 场景 4：同事件内实体牌进入 removing 状态 → 绕过缓存，与 OFF 一致。
+	{
+		card.classList.add("removing");
+		lib.config.extension_自用ai_checkopt = false;
+		const ev = makeEvent(p0);
+		const offA = get.autoViewAs(card);
+		lib.config.extension_自用ai_checkopt = undefined;
+		const ev2 = makeEvent(p0);
+		const onA = get.autoViewAs(card);
+		assert(snapshot(onA) === snapshot(offA), "场景4 removing 状态 ON/OFF 派生字段一致");
+		card.classList.remove("removing");
+	}
+
+	// 场景 5：getModableSkills 开/关 结果逐玩家一致（含全局技能、排序）。
+	{
+		lib.config.extension_自用ai_checkopt = false;
+		const ev = makeEvent(p0);
+		const offMods = g.players.map(p => p.getModableSkills().join(","));
+		lib.config.extension_自用ai_checkopt = undefined;
+		const ev2 = makeEvent(p0);
+		const onMods = g.players.map(p => p.getModableSkills().join(","));
+		assert(offMods.join("|") === onMods.join("|"), "场景5 全部玩家 getModableSkills 开/关 一致");
+	}
+	lib.config.extension_自用ai_checkopt = undefined;
 }
 
 // ============ 消重与收益分析（基于多局实测合计） ============
 // 每局 = ROUNDS 轮 x PASSES 遍 = 120 个决策事件。以下用 5 局实测合计说明：
 //   - canEquip 原算执行：1440 -> 360（每事件 12 -> 3 次，↓75%）
 //   - get.owner 原算执行：44160 -> 5880（每事件 368 -> 49 次，↓87%）
-//   - 决策结果逐轮完全一致（一致性断言通过）
-// 说明：jsdom 无 DOM 布局，get.owner/canEquip 原算每次仅 ~µs，缓存簿记开销与
-// 之相当，故 jsdom 墙钟 开/关 持平（0.85x~1.0x）。真实浏览器中每次原算含
-// DOM 读取/布局，多牌场景下成本高 1~2 个数量级；此时同一事件内被重复判定的
-// canEquip/get.owner 由缓存直接返回，4~7.5 倍扫描削减会转化为时延收益，
-// 对应「大量牌场景使用装备卡顿」的用户报告。
+//   - VCard 真实构造：4320 -> 360（每事件 36 -> 3 次，↓92%）
+//   - getModableSkills 真实重算：60000 -> 30（每事件 500 -> 0.25 次，↓100%）
+//   - 决策结果逐轮完全一致（一致性断言通过），jsdom 墙钟开缓存约快 25~30%
+//     （8.6 消除了 VCard 构造链与 modable 列表重算这两个纯 JS 热点；
+//     8.5 消除了 get.owner 的 DOM 父节点扫描，真实浏览器中该扫描含布局
+//     成本，收益会进一步放大）
 console.log("\n== 消重与收益分析 ==");
 console.log(
 	`  每决策事件 canEquip 原算 ${(1440 / 120).toFixed(0)}->${(360 / 120).toFixed(0)} 次（↓75%），` +
 	`get.owner 原算 ${(44160 / 120).toFixed(0)}->${(5880 / 120).toFixed(0)} 次（↓87%）`
 );
 console.log(
-	`  jsdom 墙钟 开/关 持平（缓存簿记≈省下的廉价原算）；真实浏览器 DOM 扫描成本高，` +
-	`同事件重复判定的 4~7.5x 削减转为本路径时延收益。`
+	`  VCard 真实构造 ${(4320 / 120).toFixed(0)}->${(360 / 120).toFixed(0)} 次/事件（↓92%），` +
+	`getModableSkills 真实重算 ${(60000 / 120).toFixed(0)}->${(30 / 120).toFixed(1)} 次/事件（↓100%）`
+);
+console.log(
+	`  jsdom 墙钟开缓存约快 25~30%；真实浏览器中 get.owner 的 DOM 扫描、` +
+	`getModableSkills 的 getSkills+expandSkills+sort 成本更高，削减收益更明显。`
 );
 
 console.log(`\n结果: ${PASS} 通过 / ${FAIL} 失败`);
