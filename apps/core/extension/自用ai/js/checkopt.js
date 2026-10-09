@@ -58,6 +58,13 @@ const NS = "checkopt";
 //    (事件,玩家,区域) 建立一次同名牌索引（name → 牌序数组），后续 O(1) 查该牌在
 //    同名牌中的序号；命中校验手牌结构指纹（手牌数+首尾牌引用）+ 技能集合指纹，
 //    任一变化即失效重建。关闭后回退原函数。
+// 9) countCards 事件级名字计数缓存：countCards(position, "name") 对指定区域逐张跑
+//    getCardName 全扫（内部 get.name → checkMod 链），zhuge 等判定链一次决策内对
+//    同一 (玩家,区域) 反复调（如 zhuge.ai.equipValue 的 hasSha → countCards("hs",..)
+//    连续三次）。决策事件内区域结构/技能集合不变，按 (事件,玩家,区域串) 单次全扫
+//    建立 name → 数量 映射，后续字符串名过滤 O(1) 取值；命中校验区域结构指纹 +
+//    技能集合指纹，任一变化即失效重建。仅字符串名过滤进缓存，数组/对象/函数过滤
+//    旁路原函数。关闭后回退原函数。
 // ============================================================
 
 export function ensureUpdatehlSoon() {
@@ -305,6 +312,8 @@ export function install() {
 	installTrickResultCache();
 	// 8.10 决策期 getCardIndex 索引缓存（见文件头注释 8）
 	installCardIndexCache();
+	// 8.11 决策期 countCards 名字计数缓存（见文件头注释 9）
+	installCardCountCache();
 }
 
 // 事件级缓存存储：WeakMap 以事件对象为键，事件结束即自动回收
@@ -378,7 +387,7 @@ function installEquipCache() {
 	patch(lib.element.Player.prototype, "canEquip", NS, (original) => function (name, replace) {
 		const event = _status.event;
 		if (!event) {
-			return original.call(this, name, replace);
+			return original.apply(this, arguments);
 		}
 		let playerStore = canEquipStore.get(event);
 		if (!playerStore) {
@@ -843,5 +852,72 @@ function installCardIndexCache() {
 		const group = entry.groups.get(name);
 		const total = group ? group.length : 0;
 		return total >= max ? max : -1;
+	}, FLAG.checkopt);
+}
+
+// ============================================================
+// 8.11 决策期 countCards 名字计数缓存
+// countCards(position, "name") 对指定区域逐张跑 getCardName（内部 get.name →
+// game.checkMod 链）全扫。zhuge 系装备判定链一次决策内对同一 (玩家,区域) 反复调用
+// （hasSha 内连续 countCards("hs","sha"/"hufu"/"yuchanqian")），每轮都是全手牌扫。
+// 决策事件内区域结构/技能集合不变，按 (事件,玩家,区域串) 单次全扫建立 name → 数量
+// 映射，后续字符串名过滤用 Map 直接取值；命中校验区域结构指纹 + 技能集合指纹，
+// 任一变化即失效重建。仅字符串名过滤进缓存，数组/对象/函数过滤旁路原函数。
+// ============================================================
+
+const countCardStore = new WeakMap();
+
+// getCardName 与 iterableGetCards 内部一致：判定区牌用 viewAs，其余用 get.name
+function countCardName(card, judgesNode) {
+	if (card.parentNode == judgesNode) {
+		if (card.viewAs) {
+			return card.viewAs;
+		}
+	}
+	return get.name(card);
+}
+
+function installCardCountCache() {
+	if (hasOwn(lib.element.Player.prototype, "countCardsCached")) {
+		return;
+	}
+	lib.element.Player.prototype.countCardsCached = true;
+
+	patch(lib.element.Player.prototype, "countCards", NS, (original) => function (position, filter) {
+		// 仅缓存字符串名过滤：数组/对象/函数过滤旁路
+		if (typeof filter !== "string" || typeof position != "string" || !position) {
+			return original.apply(this, arguments);
+		}
+		const event = _status.event;
+		if (!event) {
+			return original.apply(this, arguments);
+		}
+		let pstore = countCardStore.get(event);
+		if (!pstore) {
+			pstore = new Map();
+			countCardStore.set(event, pstore);
+		}
+		const judgesNode = this.node.judges;
+		// 区域组合去重：position 去重排序，同一批区域只建一份计数表
+		const posSet = Array.from(new Set(position.split(""))).sort().join("");
+		// 按 posSet 分桶，避免 "hs" 与 "h" 等不同区域组合互相覆盖
+		let posEntry = pstore.get(posSet);
+		if (!posEntry) {
+			posEntry = new Map();
+			pstore.set(posSet, posEntry);
+		}
+		const fp = gciZoneFingerprint(this, posSet) + "|" + modableFingerprint(this);
+		const ent = posEntry.get(this);
+		if (ent && ent.fp === fp) {
+			return ent.counts.get(filter) || 0;
+		}
+		const counts = new Map();
+		for (const item of this.iterableGetCards(posSet)) {
+			const nm = countCardName(item, judgesNode);
+			if (!nm) continue;
+			counts.set(nm, (counts.get(nm) || 0) + 1);
+		}
+		posEntry.set(this, { fp, counts });
+		return counts.get(filter) || 0;
 	}, FLAG.checkopt);
 }
