@@ -65,6 +65,12 @@ const NS = "checkopt";
 //    建立 name → 数量 映射，后续字符串名过滤 O(1) 取值；命中校验区域结构指纹 +
 //    技能集合指纹，任一变化即失效重建。仅字符串名过滤进缓存，数组/对象/函数过滤
 //    旁路原函数。关闭后回退原函数。
+// 10) countCards 复用 getCardIndex 索引：getCardIndex 的唯一调用方 get.value
+//    （get/index.js:6680）在决策事件内先于 ai.value/equipValue 触发，已为
+//    (事件,玩家,"hs") 建好同名牌分组索引。countCards("hs",..) 缓存 miss 时若
+//    该索引的指纹仍有效，直接从其 groups 求 count（组长度），省掉一次全手牌扫。
+//    posSet 与 gci 的 argKey 均经排序去重（"hs" 恒定），区域含 "j" 时 viewAs
+//    语义与 gci 的 get.name 不同，不作复用，仍走自身全扫。
 // ============================================================
 
 export function ensureUpdatehlSoon() {
@@ -819,7 +825,7 @@ function installCardIndexCache() {
 		const argKey = arg1;
 		const fp = argKey + "|" + gciZoneFingerprint(this, arg1) + "|" + modableFingerprint(this);
 		if (!entry || entry.fp !== fp) {
-			entry = { fp, args: argKey, groups: new Map(), relIndex: new Map(), cardName: new Map() };
+			entry = { fp, args: argKey, groups: new Map(), relIndex: new Map(), cardName: new Map(), hasGlows: false };
 			// 单次全扫：同名牌分组（name → 牌序数组），并为每张牌记其在组内序号
 			for (const item of this.iterableGetCards(arg1)) {
 				let groupName;
@@ -829,6 +835,9 @@ function installCardIndexCache() {
 					groupName = typeof item == "object" && item ? item.name : "";
 				}
 				if (!groupName) continue;
+				if (!entry.hasGlows && hasCardClass(item, "glows")) {
+					entry.hasGlows = true;
+				}
 				let group = entry.groups.get(groupName);
 				if (!group) {
 					group = [];
@@ -911,11 +920,30 @@ function installCardCountCache() {
 		if (ent && ent.fp === fp) {
 			return ent.counts.get(filter) || 0;
 		}
-		const counts = new Map();
-		for (const item of this.iterableGetCards(posSet)) {
-			const nm = countCardName(item, judgesNode);
-			if (!nm) continue;
-			counts.set(nm, (counts.get(nm) || 0) + 1);
+		let counts;
+		// 复用 gci 索引：同一事件 getCardIndex 已为 (玩家, "hs") 建好同名牌分组，
+		// 手牌区的扫描范围在无特殊牌（glows）时等价，可安全复用；区域含 "j"（判定
+		// 区）时 countCardName 的 viewAs 语义与 gci 的 get.name 不同，跳过复用。
+		// gciEntry.args 需与 posSet 覆盖同一批手牌节点（"h"/"hs"），且
+		// "h" 仅在该玩家无 glows 特殊牌时可复用（有则 "hs" 多计了特殊牌）。
+		let gciEntry = posSet.includes("j") ? null : (gciStore.get(event) || new Map()).get(this);
+		if (
+			gciEntry &&
+			(posSet === gciEntry.args || (posSet === "h" && gciEntry.args === "hs" && !gciEntry.hasGlows)) &&
+			gciEntry.fp === gciEntry.args + "|" + fp
+		) {
+			counts = new Map();
+			for (const [nm, group] of gciEntry.groups) {
+				counts.set(nm, group.length);
+			}
+		}
+		if (!counts) {
+			counts = new Map();
+			for (const item of this.iterableGetCards(posSet)) {
+				const nm = countCardName(item, judgesNode);
+				if (!nm) continue;
+				counts.set(nm, (counts.get(nm) || 0) + 1);
+			}
 		}
 		posEntry.set(this, { fp, counts });
 		return counts.get(filter) || 0;
